@@ -1,0 +1,7 @@
+[package]
+name = "unsizing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+unsizing-proc = { path = "../unsizing-proc" }
