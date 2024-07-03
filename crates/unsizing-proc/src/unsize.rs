@@ -1,16 +1,20 @@
 use crate::util::MultiError;
-use proc_macro2::{Ident, TokenStream};
-use quote::{quote_spanned, ToTokens};
+use proc_macro2::{Ident, Literal, TokenStream};
+use quote::{quote, quote_spanned, ToTokens};
+
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    Attribute, Error, Field, Fields, Index, Item, ItemEnum, ItemStruct, Member, Meta, Token, Type,
-    Variant,
+    AttrStyle, Attribute, Error, Field, FieldMutability, Fields, FieldsNamed, FieldsUnnamed,
+    GenericParam, Generics, Index, Item, ItemEnum, ItemStruct, Lifetime, LifetimeParam,
+    MacroDelimiter, Member, Meta, MetaList, Token, Type, TypeTuple, Variant, Visibility,
 };
 
+#[derive(Clone)]
 enum MetaLoc {
     Field(Ident),
     Tuple(Index),
+    Variant(Ident, Index),
 }
 
 impl ToTokens for MetaLoc {
@@ -18,6 +22,7 @@ impl ToTokens for MetaLoc {
         let toks = match self {
             MetaLoc::Field(name) => quote_spanned!(name.span() => #name.read()),
             MetaLoc::Tuple(idx) => quote_spanned!(idx.span() => meta.#idx),
+            MetaLoc::Variant(var, idx) => quote_spanned!(var.span() => meta.#var.#idx),
         };
         tokens.extend(toks);
     }
@@ -65,6 +70,7 @@ fn process_field(
     metadata: &mut Vec<MetaLoc>,
     idx: usize,
     field: &Field,
+    enum_var: Option<&Ident>,
 ) -> Result<(), MultiError> {
     let mut meta = None;
     let mut errs = MultiError::empty();
@@ -80,12 +86,15 @@ fn process_field(
 
     field_names.push(name);
     field_tys.push(field.ty.clone());
-    metadata.push(meta.unwrap_or_else(|| MetaLoc::Tuple(Index::from(idx))));
+    metadata.push(meta.unwrap_or_else(|| match enum_var {
+        Some(var) => MetaLoc::Variant(var.clone(), Index::from(idx)),
+        None => MetaLoc::Tuple(Index::from(idx)),
+    }));
 
     errs.empty_or(())
 }
 
-fn pointee_impls_struct(name: &Ident, fields: &Fields) -> Result<TokenStream, MultiError> {
+fn impls_struct(name: &Ident, fields: &Fields) -> Result<TokenStream, MultiError> {
     let mut field_names = Vec::new();
     let mut field_tys = Vec::new();
     let mut read_meta = Vec::new();
@@ -108,6 +117,7 @@ fn pointee_impls_struct(name: &Ident, fields: &Fields) -> Result<TokenStream, Mu
                 &mut read_meta,
                 idx,
                 field,
+                None,
             ));
             err
         })
@@ -132,6 +142,7 @@ fn pointee_impls_struct(name: &Ident, fields: &Fields) -> Result<TokenStream, Mu
         .map(|(ty, meta)| match meta {
             MetaLoc::Tuple(_) => quote_spanned!(ty.span() => <#ty as unsizing::Pointee>::Meta),
             MetaLoc::Field(_) => quote_spanned!(ty.span() => ()),
+            MetaLoc::Variant(_, _) => unreachable!(),
         })
         .collect::<Vec<_>>();
 
@@ -253,7 +264,7 @@ fn process_struct(s: ItemStruct) -> Result<TokenStream, MultiError> {
     // redundant.
     errs.empty_or(())?;
 
-    let pointee_impl = pointee_impls_struct(&name, &fields)?;
+    let pointee_impl = impls_struct(&name, &fields)?;
     // size_of_val on this is correct, but align_of_val is a lie - we just use a high enough alignment
     // that it shouldn't cause issues.
     // TODO: Provide a way to manually increase this alignment.
@@ -266,11 +277,384 @@ fn process_struct(s: ItemStruct) -> Result<TokenStream, MultiError> {
     ))
 }
 
-fn pointee_impls_enum(name: &Ident, variants: &Punctuated<Variant, Token![,]>) {}
+fn make_meta_ty(
+    name: &Ident,
+    vis: &Visibility,
+    variants: &Punctuated<Variant, Token![,]>,
+) -> ItemStruct {
+    let name = Ident::new(&(name.to_string() + "Meta"), name.span());
+
+    let fields = variants.iter().fold(
+        FieldsNamed {
+            brace_token: Default::default(),
+            named: Punctuated::default(),
+        },
+        |mut fields, variant| {
+            let tys = variant
+                .fields
+                .iter()
+                .map(|field| {
+                    let ty = &field.ty;
+                    syn::parse2::<Type>(
+                        quote_spanned!(ty.span() => <#ty as unsizing::Pointee>::Meta),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            fields.named.push(Field {
+                attrs: vec![],
+                vis: Visibility::Inherited,
+                mutability: FieldMutability::None,
+                ident: Some(variant.ident.clone()),
+                colon_token: Default::default(),
+                ty: Type::Tuple(TypeTuple {
+                    paren_token: Default::default(),
+                    elems: tys,
+                }),
+            });
+            fields
+        },
+    );
+    ItemStruct {
+        attrs: vec![
+            Attribute {
+                pound_token: Default::default(),
+                style: AttrStyle::Outer,
+                bracket_token: Default::default(),
+                meta: Meta::List(MetaList {
+                    path: Ident::new("derive", name.span()).into(),
+                    delimiter: MacroDelimiter::Paren(Default::default()),
+                    tokens: quote_spanned!(name.span() => Copy, Clone),
+                }),
+            },
+            Attribute {
+                pound_token: Default::default(),
+                style: AttrStyle::Outer,
+                bracket_token: Default::default(),
+                meta: Meta::List(MetaList {
+                    path: Ident::new("allow", name.span()).into(),
+                    delimiter: MacroDelimiter::Paren(Default::default()),
+                    tokens: quote_spanned!(name.span() => non_snake_case),
+                }),
+            },
+        ],
+        vis: vis.clone(),
+        struct_token: Default::default(),
+        ident: name,
+        generics: Default::default(),
+        fields: Fields::Named(fields),
+        semi_token: None,
+    }
+}
+
+fn make_field_ty(
+    name: &Ident,
+    vis: &Visibility,
+    variants: &Punctuated<Variant, Token![,]>,
+) -> ItemEnum {
+    let name = Ident::new(&(name.to_string() + "Fields"), name.span());
+
+    let variants = variants
+        .iter()
+        .map(|variant| {
+            let fields = variant
+                .fields
+                .iter()
+                .map(|field| {
+                    let ty = &field.ty;
+                    Field {
+                        attrs: vec![],
+                        vis: Visibility::Inherited,
+                        mutability: FieldMutability::None,
+                        ident: None,
+                        colon_token: None,
+                        ty: syn::parse2(quote_spanned!(field.span() => unsizing::Ptr<#ty>))
+                            .unwrap(),
+                    }
+                })
+                .collect();
+
+            let fields = Fields::Unnamed(FieldsUnnamed {
+                paren_token: Default::default(),
+                unnamed: fields,
+            });
+
+            Variant {
+                attrs: vec![],
+                ident: variant.ident.clone(),
+                fields,
+                discriminant: None,
+            }
+        })
+        .collect();
+
+    ItemEnum {
+        attrs: vec![],
+        vis: vis.clone(),
+        enum_token: Default::default(),
+        ident: name,
+        generics: Default::default(),
+        brace_token: Default::default(),
+        variants,
+    }
+}
+
+fn make_ref_tys(
+    name: &Ident,
+    vis: &Visibility,
+    variants: &Punctuated<Variant, Token![,]>,
+) -> (ItemEnum, ItemEnum) {
+    let ref_name = Ident::new(&(name.to_string() + "Ref"), name.span());
+    let mut_name = Ident::new(&(name.to_string() + "Mut"), name.span());
+
+    let ref_variants = variants
+        .iter()
+        .map(|variant| {
+            let mut out = variant.clone();
+            out.fields.iter_mut().for_each(|field| {
+                let ty = &field.ty;
+                let ty = syn::parse2(quote!(unsizing::Ref<'a, #ty>)).unwrap();
+                field.ty = ty;
+            });
+            out
+        })
+        .collect();
+
+    let mut_variants = variants
+        .iter()
+        .map(|variant| {
+            let mut out = variant.clone();
+            out.fields.iter_mut().for_each(|field| {
+                let ty = &field.ty;
+                let ty = syn::parse2(quote!(unsizing::RefMut<'a, #ty>)).unwrap();
+                field.ty = ty;
+            });
+            out
+        })
+        .collect();
+
+    let params = Punctuated::from_iter([GenericParam::Lifetime(LifetimeParam {
+        attrs: vec![],
+        lifetime: Lifetime::new("'a", name.span()),
+        colon_token: None,
+        bounds: Default::default(),
+    })]);
+
+    let ref_ty = ItemEnum {
+        attrs: vec![],
+        vis: vis.clone(),
+        enum_token: Default::default(),
+        ident: ref_name,
+        generics: Generics {
+            lt_token: None,
+            params: params.clone(),
+            gt_token: None,
+            where_clause: None,
+        },
+        brace_token: Default::default(),
+        variants: ref_variants,
+    };
+    let mut_ty = ItemEnum {
+        attrs: vec![],
+        vis: vis.clone(),
+        enum_token: Default::default(),
+        ident: mut_name,
+        generics: Generics {
+            lt_token: None,
+            params,
+            gt_token: None,
+            where_clause: None,
+        },
+        brace_token: Default::default(),
+        variants: mut_variants,
+    };
+    (ref_ty, mut_ty)
+}
+
+fn impls_enum(
+    name: &Ident,
+    vis: &Visibility,
+    variants: &Punctuated<Variant, Token![,]>,
+) -> Result<TokenStream, MultiError> {
+    let meta_ty = make_meta_ty(name, vis, variants);
+    let field_ty = make_field_ty(name, vis, variants);
+    let (ref_ty, mut_ty) = make_ref_tys(name, vis, variants);
+    let mut errs = MultiError::empty();
+
+    let mut all_field_tys = Vec::new();
+    let mut all_field_metas = Vec::new();
+    let mut variant_names = Vec::new();
+    let mut variant_vals = Vec::new();
+    let mut variant_fields = Vec::new();
+    let mut cur_var_val = 0;
+    for variant in variants {
+        variant_names.push(variant.ident.clone());
+        let var_val = match &variant.discriminant {
+            None => {
+                let var_val = Literal::i32_unsuffixed(cur_var_val);
+                cur_var_val += 1;
+                quote_spanned!(variant.span() => #var_val)
+            }
+            Some((_, val)) => val.to_token_stream(),
+        };
+        variant_vals.push(var_val);
+
+        let mut field_names = Vec::new();
+        let mut field_tys = Vec::new();
+        let mut read_meta = Vec::new();
+        for (field_idx, field) in variant.fields.iter().enumerate() {
+            all_field_tys.push(field.ty.clone());
+            errs.and(process_field(
+                &mut field_names,
+                &mut field_tys,
+                &mut read_meta,
+                field_idx,
+                field,
+                Some(&variant.ident),
+            ));
+            all_field_metas.push(read_meta.last().unwrap().clone());
+        }
+        assert!(read_meta
+            .iter()
+            .all(|loc| matches!(loc, MetaLoc::Variant(..))));
+        variant_fields.push((field_names, field_tys, read_meta));
+    }
+
+    let (variant_size_field_calc, field_tuple): (Vec<_>, Vec<_>) = variant_fields
+        .iter()
+        .map(|(field_names, field_tys, read_meta)| {
+            let a = quote_spanned!(
+                name.span() =>
+                #(
+                let #field_names = {
+                    let field_align = <#field_tys as unsizing::MetaAlign>::align(#read_meta);
+                    let field_size = <#field_tys as unsizing::MetaSize>::size(#read_meta);
+                    let offset = ptr.byte_add(size).byte_align_offset(field_align);
+                    let ptr = ptr.byte_add(size + offset).cast_meta::<#field_tys>(#read_meta);
+                    size += offset + field_size;
+                    ptr
+                };
+                )*
+            );
+            let b = quote_spanned!(
+                name.span() =>
+                #( #field_names, )*
+            );
+            (a, b)
+        })
+        .unzip();
+
+    let (var_match_fields, var_as_ref, var_as_mut) = variant_fields.iter().zip(variants).fold(
+        (Vec::new(), Vec::new(), Vec::new()),
+        |(mut var_match_fields, mut var_as_ref, mut var_as_mut), ((field_names, _, _), variant)| {
+            let members = variant
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(idx, f)| match &f.ident {
+                    Some(name) => Member::Named(name.clone()),
+                    None => Member::Unnamed(Index::from(idx)),
+                })
+                .collect::<Vec<_>>();
+            var_match_fields.push(quote_spanned!(name.span() => #( #field_names, )* ));
+            var_as_ref.push(
+                quote_spanned!(name.span() => #( #members: #field_names.as_ref_unchecked(), )* ),
+            );
+            var_as_mut.push(
+                quote_spanned!(name.span() => #( #members: #field_names.cast_mut().as_mut_unchecked(), )* ),
+            );
+            (var_match_fields, var_as_ref, var_as_mut)
+        },
+    );
+
+    errs.empty_or(())?;
+    let repr_ty = quote_spanned!(name.span() => isize);
+
+    let meta_ty_name = &meta_ty.ident;
+    let field_ty_name = &field_ty.ident;
+    let ref_ty_name = &ref_ty.ident;
+    let mut_ty_name = &mut_ty.ident;
+
+    Ok(quote_spanned!(name.span() =>
+        #meta_ty
+        #field_ty
+        #ref_ty
+        #mut_ty
+
+        impl #name {
+            #vis fn as_ref<'a>(self: unsizing::Ref<'a, Self>) -> #ref_ty_name<'a> {
+                let layout = unsafe { <Self as unsizing::Pointee>::layout(unsizing::Ptr::from_ref(self)) };
+                #[allow(unused_unsafe)]
+                match layout.fields() {
+                    #(
+                    #field_ty_name::#variant_names( #var_match_fields ) => unsafe { #ref_ty_name::#variant_names { #var_as_ref } },
+                    )*
+                }
+            }
+
+            #vis fn as_mut<'a>(self: unsizing::RefMut<'a, Self>) -> #mut_ty_name<'a> {
+                let layout = unsafe { <Self as unsizing::Pointee>::layout(unsizing::PtrMut::from_mut(self).cast_const()) };
+                #[allow(unused_unsafe)]
+                match layout.fields() {
+                    #(
+                    #field_ty_name::#variant_names( #var_match_fields ) => unsafe { #mut_ty_name::#variant_names { #var_as_mut } },
+                    )*
+                }
+            }
+        }
+
+        impl unsizing::Pointee for SliceOption {
+            const IS_STD_UNSIZED: bool = false;
+            // We need to track the size/align of the original enum location - since it may be greater than
+            // what we see just from our current state. (EG SliceOptionSized::<[u32; 4]::None - our unsized
+            // size is 1, align 1, but actual size/align is 20/4).
+            type Meta = #meta_ty_name;
+            type Fields = #field_ty_name;
+
+            unsafe fn layout(ptr: unsizing::Ptr<Self>) -> unsizing::Layout<Self> {
+                let variant = ptr.cast_meta::<#repr_ty>(()).read();
+                let meta = ptr.metadata();
+
+                let align = [
+                    <#repr_ty as unsizing::MetaAlign>::align(()),
+                    #(
+                    <#all_field_tys as unsizing::MetaAlign>::align(#all_field_metas)
+                    )*
+                ]
+                .into_iter()
+                .max()
+                .unwrap_or(1);
+
+                let repr_size = unsizing::__impl::align_up(size_of::<#repr_ty>(), align);
+                let ptr = ptr.byte_add(repr_size);
+
+                let mut fields = std::mem::MaybeUninit::uninit();
+                let sizes = [
+                    #(
+                    {
+                        #[allow(unused_mut)]
+                        let mut size = 0;
+                        #variant_size_field_calc
+                        if variant == #variant_vals {
+                            fields.write(#field_ty_name::#variant_names( #field_tuple ));
+                        }
+                        size
+                    },
+                    )*
+                ];
+
+                // SAFETY: Validity precondition that tag is a valid variant
+                let fields = fields.assume_init();
+                let var_size = sizes.into_iter().max().unwrap_or(0);
+                // Size is largest variant + enough space for tag
+                unsizing::Layout::new(fields, repr_size + var_size, align)
+            }
+        }
+    ))
+}
 
 fn process_enum(e: ItemEnum) -> Result<TokenStream, MultiError> {
-    Err(Error::new(e.ident.span(), "`#[unsize]` is not yet supported on enums").into())
-    /*let val_span = e.span();
+    let val_span = e.span();
     let mut errs = MultiError::empty();
     let ItemEnum {
         vis,
@@ -298,7 +682,8 @@ fn process_enum(e: ItemEnum) -> Result<TokenStream, MultiError> {
     // redundant.
     errs.empty_or(())?;
 
-    let pointee_impl = pointee_impls_enum(&name, &variants)?;
+    let pointee_impl = impls_enum(&name, &vis, &variants)?;
+    println!("Enum Impls: {}", pointee_impl.to_string());
     // size_of_val on this is correct, but align_of_val is a lie - we just use a high enough alignment
     // that it shouldn't cause issues.
     // TODO: Provide a way to manually increase this alignment.
@@ -309,7 +694,6 @@ fn process_enum(e: ItemEnum) -> Result<TokenStream, MultiError> {
 
         #pointee_impl
     ))
-     */
 }
 
 pub fn _impl(ts: TokenStream) -> Result<TokenStream, MultiError> {
