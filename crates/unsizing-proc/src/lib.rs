@@ -13,6 +13,7 @@ pub fn unsize(extra: TokenStream, input: TokenStream) -> TokenStream {
     }
 }
 
+// TODO: Maybe make this a derive.
 #[proc_macro_attribute]
 pub fn unsize_to(extra: TokenStream, input: TokenStream) -> TokenStream {
     match unsize_to::_impl(extra.into(), input.into()) {

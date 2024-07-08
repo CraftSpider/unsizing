@@ -3,9 +3,10 @@
 use unsizing::{unsize, Pointee, Ptr};
 
 #[unsize]
+#[repr(C)]
 struct PaddedStart {
-    a: u8,
-    b: u32,
+    pub a: u8,
+    pub b: u32,
 }
 
 #[test]
@@ -16,9 +17,10 @@ fn test_padded_start() {
 }
 
 #[unsize]
+#[repr(C)]
 struct PaddedEnd {
-    a: u32,
-    b: u8,
+    pub a: u32,
+    pub b: u8,
 }
 
 #[test]
@@ -29,10 +31,11 @@ fn test_padded_end() {
 }
 
 #[unsize]
+#[repr(C)]
 struct MaybeAligned {
-    a: [u8],
-    b: [u32],
-    c: [u8],
+    pub a: [u8],
+    pub b: [u32],
+    pub c: [u8],
 }
 
 #[test]

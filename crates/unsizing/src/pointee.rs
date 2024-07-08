@@ -116,9 +116,7 @@ impl<T> Pointee for T {
         ptr.cast::<T>()
     }
 
-    fn metadata(_: *const Self) -> Self::Meta {
-        ()
-    }
+    fn metadata(_: *const Self) -> Self::Meta {}
 }
 
 impl<T> FixedAlign for T {

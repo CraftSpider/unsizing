@@ -74,11 +74,7 @@ impl<T: ?Sized + Pointee> Ptr<T> {
     }
 
     pub unsafe fn as_ref<'a>(self) -> Option<Ref<'a, T>> {
-        if let Some(ptr) = NonNull::new(self.ptr.cast_mut()) {
-            Some(Ref::new(ptr, self.meta))
-        } else {
-            None
-        }
+        NonNull::new(self.ptr.cast_mut()).map(|ptr| Ref::new(ptr, self.meta))
     }
 
     pub unsafe fn as_ref_unchecked<'a>(self) -> Ref<'a, T> {
@@ -138,11 +134,7 @@ impl<T: ?Sized + Pointee> PtrMut<T> {
     }
 
     pub unsafe fn as_ref<'a>(self) -> Option<Ref<'a, T>> {
-        if let Some(ptr) = NonNull::new(self.ptr) {
-            Some(Ref::new(ptr, self.meta))
-        } else {
-            None
-        }
+        NonNull::new(self.ptr).map(|ptr| Ref::new(ptr, self.meta))
     }
 
     pub unsafe fn as_ref_unchecked<'a>(self) -> Ref<'a, T> {
@@ -151,11 +143,7 @@ impl<T: ?Sized + Pointee> PtrMut<T> {
     }
 
     pub unsafe fn as_mut<'a>(self) -> Option<RefMut<'a, T>> {
-        if let Some(ptr) = NonNull::new(self.ptr) {
-            Some(RefMut::new(ptr, self.meta))
-        } else {
-            None
-        }
+        NonNull::new(self.ptr).map(|ptr| RefMut::new(ptr, self.meta))
     }
 
     pub unsafe fn as_mut_unchecked<'a>(self) -> RefMut<'a, T> {

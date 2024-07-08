@@ -1,15 +1,17 @@
 #![feature(arbitrary_self_types)]
+#![allow(clippy::disallowed_names)]
 
 use unsizing::{unsize, unsize_to};
 // Now to figure out how to do constructors
 // We want custom unsizing for one.
 
 #[unsize]
+#[repr(C)]
 pub struct Foo {
-    a: u32,
-    b: f32,
-    c: [u8],
-    d: [i32],
+    pub a: u32,
+    pub b: f32,
+    pub c: [u8],
+    pub d: [i32],
 }
 
 #[unsize_to(Foo)]
@@ -23,22 +25,26 @@ pub struct FooSized<const LEN_1: usize, const LEN_2: usize> {
 }
 
 #[unsize]
+#[repr(C)]
 pub struct Bar {
-    a: usize,
-    b: f32,
+    // This is ill-advised - changing inline can cause UB.
+    pub a: usize,
+    pub b: f32,
     #[meta(a)]
-    c: str,
+    pub c: str,
 }
 
 #[unsize]
-pub struct Baz(u32, Foo, u32);
+#[repr(C)]
+pub struct Baz(pub u32, pub Foo, pub u32);
 
 #[unsize_to(Baz)]
+#[repr(C)]
 #[derive(Debug)]
 pub struct BazSized<const LEN_1: usize, const LEN_2: usize>(u32, FooSized<LEN_1, LEN_2>, u32);
 
 fn main() {
-    use unsizing::{Pointee, Ptr, Ref, Unsize};
+    use unsizing::{Ref, Unsize};
 
     let foo_sized = FooSized {
         a: 1,
@@ -55,10 +61,6 @@ fn main() {
 
     let baz_sized = BazSized(10, foo_sized.clone(), 10);
     let baz: Ref<'_, Baz> = baz_sized.unsize();
-
-    dbg!(&baz_sized);
-    dbg!(Ptr::from_ref(baz));
-    unsafe { dbg!(Pointee::layout(Ptr::from_ref(baz))) };
 
     assert_eq!(*baz.field_0(), 10);
     assert_eq!(*baz.field_1().a(), 1);

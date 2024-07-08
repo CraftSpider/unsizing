@@ -12,6 +12,23 @@
 //! `MetaAlign` should be implemented for all types that don't use inline metadata OR are
 //! `FixedAlign`.
 
+#![warn(
+    // missing_docs,
+    elided_lifetimes_in_paths,
+    explicit_outlives_requirements,
+    missing_abi,
+    noop_method_call,
+    semicolon_in_expressions_from_macros,
+    unused_import_braces,
+    unused_lifetimes,
+    clippy::cargo,
+    clippy::missing_panics_doc,
+    clippy::doc_markdown,
+    clippy::ptr_as_ptr,
+    clippy::cloned_instead_of_copied,
+    clippy::unreadable_literal
+)]
+
 pub use unsizing_proc::{unsize, unsize_to};
 
 mod inline;
@@ -28,13 +45,37 @@ pub use unsize_::Unsize;
 
 #[doc(hidden)]
 pub mod __impl {
-    use crate::{Pointee, Ptr, Ref};
+    use crate::{Pointee, Ptr, Ref, Unsize};
+    use std::marker::PhantomData;
+
+    pub trait EnumHelper {
+        type Phantom;
+    }
+
+    pub struct Metadata<T: ?Sized + Pointee>(pub T::Meta);
 
     pub fn unsize_check<T: ?Sized + Pointee, R: ?Sized + Pointee>(
-        r: Ref<T>,
-        _: fn(Ref<R>) -> Ref<T>,
+        r: Ref<'_, T>,
+        _: fn(Ref<'_, R>) -> Ref<'_, T>,
     ) -> T::Meta {
         Ptr::from_ref(r).metadata()
+    }
+
+    pub fn unsize_check_meta<T, U, R>(_: fn(Ref<'_, R>) -> Ref<'_, U>) -> U::Meta
+    where
+        T: ?Sized + Pointee + Unsize<U>,
+        U: ?Sized + Pointee,
+        R: ?Sized + Pointee,
+    {
+        T::unsize_meta()
+    }
+
+    pub fn unsize_check_meta_enum<T, U>(_: PhantomData<U>) -> U::Meta
+    where
+        T: ?Sized + Pointee + Unsize<U>,
+        U: ?Sized + Pointee,
+    {
+        T::unsize_meta()
     }
 
     pub fn align_up(size: usize, align: usize) -> usize {

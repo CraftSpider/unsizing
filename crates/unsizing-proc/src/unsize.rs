@@ -1,5 +1,5 @@
-use crate::util::MultiError;
-use proc_macro2::{Ident, Literal, TokenStream};
+use crate::util::{ItemExt, MultiError, ReprTy};
+use proc_macro2::{Ident, Literal, Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
 
 use syn::punctuated::Punctuated;
@@ -7,7 +7,7 @@ use syn::spanned::Spanned;
 use syn::{
     AttrStyle, Attribute, Error, Field, FieldMutability, Fields, FieldsNamed, FieldsUnnamed,
     GenericParam, Generics, Index, Item, ItemEnum, ItemStruct, Lifetime, LifetimeParam,
-    MacroDelimiter, Member, Meta, MetaList, Token, Type, TypeTuple, Variant, Visibility,
+    MacroDelimiter, Member, Meta, MetaList, Type, TypeTuple, Variant, Visibility,
 };
 
 #[derive(Clone)]
@@ -94,7 +94,23 @@ fn process_field(
     errs.empty_or(())
 }
 
-fn impls_struct(name: &Ident, fields: &Fields) -> Result<TokenStream, MultiError> {
+fn impls_struct(s: &ItemStruct, attrs: &Attrs<'_>) -> Result<TokenStream, MultiError> {
+    if attrs.repr == ReprTy::None {
+        return Err(Error::new(
+            s.ident.span(),
+            "Missing repr type on `#[unsize]` item. The implicit `repr(Rust)` is unsupported.",
+        )
+        .into());
+    } else if attrs.repr != ReprTy::C {
+        return Err(Error::new(
+            s.ident.span(),
+            "Invalid repr for `#[unsize]` on a struct. Expected `C`",
+        )
+        .into());
+    }
+
+    let name = &s.ident;
+    let fields = &s.fields;
     let mut field_names = Vec::new();
     let mut field_tys = Vec::new();
     let mut read_meta = Vec::new();
@@ -135,6 +151,8 @@ fn impls_struct(name: &Ident, fields: &Fields) -> Result<TokenStream, MultiError
             Ident::new(&new_name, name.span())
         })
         .collect::<Vec<_>>();
+
+    let field_vis = fields.iter().map(|field| &field.vis).collect::<Vec<_>>();
 
     let metadata = field_tys
         .iter()
@@ -186,13 +204,12 @@ fn impls_struct(name: &Ident, fields: &Fields) -> Result<TokenStream, MultiError
     Ok(quote_spanned!(fields.span() =>
         impl #name {
             #(
-            fn #field_names<'a>(self: unsizing::Ref<'a, Self>) -> unsizing::Ref<'a, #field_tys> {
+            #field_vis fn #field_names<'a>(self: unsizing::Ref<'a, Self>) -> unsizing::Ref<'a, #field_tys> {
                 let ptr = unsafe { <Self as unsizing::Pointee>::layout(unsizing::Ptr::from_ref(self)).fields().#idxs };
-                dbg!(ptr);
                 unsafe { ptr.as_ref_unchecked() }
             }
 
-            fn #field_names_mut<'a>(self: unsizing::RefMut<'a, Self>) -> unsizing::RefMut<'a, #field_tys> {
+            #field_vis fn #field_names_mut<'a>(self: unsizing::RefMut<'a, Self>) -> unsizing::RefMut<'a, #field_tys> {
                 let ptr = unsafe { <Self as unsizing::Pointee>::layout(unsizing::PtrMut::from_mut(self).cast_const()).fields().#idxs }.cast_mut();
                 unsafe { ptr.as_mut_unchecked() }
             }
@@ -234,57 +251,10 @@ fn impls_struct(name: &Ident, fields: &Fields) -> Result<TokenStream, MultiError
     ))
 }
 
-fn process_struct(s: ItemStruct) -> Result<TokenStream, MultiError> {
-    let val_span = s.span();
-    let mut errs = MultiError::empty();
-    let ItemStruct {
-        vis,
-        struct_token,
-        ident: name,
-        fields,
-        generics,
-        attrs,
-        ..
-    } = s;
+fn make_meta_ty(e: &ItemEnum) -> ItemStruct {
+    let name = Ident::new(&(e.ident.to_string() + "Meta"), e.ident.span());
 
-    if !attrs.is_empty() {
-        errs.push(Error::new(
-            attrs.first().unwrap().span(),
-            "`#[unsize]` currently doesn't support other item-level attributes",
-        ));
-    }
-    if !generics.to_token_stream().is_empty() {
-        errs.push(Error::new(
-            generics.span(),
-            "`#[unsize]` currently doesn't support generics",
-        ));
-    }
-
-    // If we have errors before here, emit now - struct-level errors mean field errors are likely
-    // redundant.
-    errs.empty_or(())?;
-
-    let pointee_impl = impls_struct(&name, &fields)?;
-    // size_of_val on this is correct, but align_of_val is a lie - we just use a high enough alignment
-    // that it shouldn't cause issues.
-    // TODO: Provide a way to manually increase this alignment.
-    Ok(quote_spanned!(
-        val_span.span() =>
-        #[repr(C, align(16))]
-        #vis #struct_token #name([std::mem::MaybeUninit<u8>]);
-
-        #pointee_impl
-    ))
-}
-
-fn make_meta_ty(
-    name: &Ident,
-    vis: &Visibility,
-    variants: &Punctuated<Variant, Token![,]>,
-) -> ItemStruct {
-    let name = Ident::new(&(name.to_string() + "Meta"), name.span());
-
-    let fields = variants.iter().fold(
+    let fields = e.variants.iter().fold(
         FieldsNamed {
             brace_token: Default::default(),
             named: Punctuated::default(),
@@ -338,7 +308,7 @@ fn make_meta_ty(
                 }),
             },
         ],
-        vis: vis.clone(),
+        vis: e.vis.clone(),
         struct_token: Default::default(),
         ident: name,
         generics: Default::default(),
@@ -347,14 +317,75 @@ fn make_meta_ty(
     }
 }
 
-fn make_field_ty(
-    name: &Ident,
-    vis: &Visibility,
-    variants: &Punctuated<Variant, Token![,]>,
-) -> ItemEnum {
-    let name = Ident::new(&(name.to_string() + "Fields"), name.span());
+fn make_phantom_ty(e: &ItemEnum) -> ItemStruct {
+    let name = Ident::new(&(e.ident.to_string() + "Phantom"), e.ident.span());
 
-    let variants = variants
+    let fields = e.variants.iter().fold(
+        FieldsNamed {
+            brace_token: Default::default(),
+            named: Punctuated::default(),
+        },
+        |mut fields, variant| {
+            let tys = variant
+                .fields
+                .iter()
+                .map(|field| {
+                    let ty = &field.ty;
+                    syn::parse2::<Type>(quote_spanned!(ty.span() => std::marker::PhantomData<#ty>))
+                        .unwrap()
+                })
+                .collect();
+            fields.named.push(Field {
+                attrs: vec![],
+                vis: Visibility::Inherited,
+                mutability: FieldMutability::None,
+                ident: Some(variant.ident.clone()),
+                colon_token: Default::default(),
+                ty: Type::Tuple(TypeTuple {
+                    paren_token: Default::default(),
+                    elems: tys,
+                }),
+            });
+            fields
+        },
+    );
+    ItemStruct {
+        attrs: vec![
+            Attribute {
+                pound_token: Default::default(),
+                style: AttrStyle::Outer,
+                bracket_token: Default::default(),
+                meta: Meta::List(MetaList {
+                    path: Ident::new("derive", name.span()).into(),
+                    delimiter: MacroDelimiter::Paren(Default::default()),
+                    tokens: quote_spanned!(name.span() => Copy, Clone),
+                }),
+            },
+            Attribute {
+                pound_token: Default::default(),
+                style: AttrStyle::Outer,
+                bracket_token: Default::default(),
+                meta: Meta::List(MetaList {
+                    path: Ident::new("allow", name.span()).into(),
+                    delimiter: MacroDelimiter::Paren(Default::default()),
+                    tokens: quote_spanned!(name.span() => non_snake_case),
+                }),
+            },
+        ],
+        vis: e.vis.clone(),
+        struct_token: Default::default(),
+        ident: name,
+        generics: Default::default(),
+        fields: Fields::Named(fields),
+        semi_token: None,
+    }
+}
+
+fn make_field_ty(e: &ItemEnum) -> ItemEnum {
+    let name = Ident::new(&(e.ident.to_string() + "Fields"), e.ident.span());
+
+    let variants = e
+        .variants
         .iter()
         .map(|variant| {
             let fields = variant
@@ -390,7 +421,7 @@ fn make_field_ty(
 
     ItemEnum {
         attrs: vec![],
-        vis: vis.clone(),
+        vis: e.vis.clone(),
         enum_token: Default::default(),
         ident: name,
         generics: Default::default(),
@@ -399,15 +430,12 @@ fn make_field_ty(
     }
 }
 
-fn make_ref_tys(
-    name: &Ident,
-    vis: &Visibility,
-    variants: &Punctuated<Variant, Token![,]>,
-) -> (ItemEnum, ItemEnum) {
-    let ref_name = Ident::new(&(name.to_string() + "Ref"), name.span());
-    let mut_name = Ident::new(&(name.to_string() + "Mut"), name.span());
+fn make_ref_tys(e: &ItemEnum) -> (ItemEnum, ItemEnum) {
+    let ref_name = Ident::new(&(e.ident.to_string() + "Ref"), e.ident.span());
+    let mut_name = Ident::new(&(e.ident.to_string() + "Mut"), e.ident.span());
 
-    let ref_variants = variants
+    let ref_variants = e
+        .variants
         .iter()
         .map(|variant| {
             let mut out = variant.clone();
@@ -420,7 +448,8 @@ fn make_ref_tys(
         })
         .collect();
 
-    let mut_variants = variants
+    let mut_variants = e
+        .variants
         .iter()
         .map(|variant| {
             let mut out = variant.clone();
@@ -435,14 +464,14 @@ fn make_ref_tys(
 
     let params = Punctuated::from_iter([GenericParam::Lifetime(LifetimeParam {
         attrs: vec![],
-        lifetime: Lifetime::new("'a", name.span()),
+        lifetime: Lifetime::new("'a", e.ident.span()),
         colon_token: None,
         bounds: Default::default(),
     })]);
 
     let ref_ty = ItemEnum {
         attrs: vec![],
-        vis: vis.clone(),
+        vis: e.vis.clone(),
         enum_token: Default::default(),
         ident: ref_name,
         generics: Generics {
@@ -456,7 +485,7 @@ fn make_ref_tys(
     };
     let mut_ty = ItemEnum {
         attrs: vec![],
-        vis: vis.clone(),
+        vis: e.vis.clone(),
         enum_token: Default::default(),
         ident: mut_name,
         generics: Generics {
@@ -471,15 +500,39 @@ fn make_ref_tys(
     (ref_ty, mut_ty)
 }
 
-fn impls_enum(
-    name: &Ident,
-    vis: &Visibility,
-    variants: &Punctuated<Variant, Token![,]>,
-) -> Result<TokenStream, MultiError> {
-    let meta_ty = make_meta_ty(name, vis, variants);
-    let field_ty = make_field_ty(name, vis, variants);
-    let (ref_ty, mut_ty) = make_ref_tys(name, vis, variants);
+fn impls_enum(e: &ItemEnum, attrs: &Attrs<'_>) -> Result<TokenStream, MultiError> {
     let mut errs = MultiError::empty();
+
+    let repr_ty = Ident::new(
+        match attrs.repr {
+            ReprTy::C => "isize",
+            ReprTy::U8 => "u8",
+            ReprTy::I8 => "i8",
+            ReprTy::U16 => "u16",
+            ReprTy::I16 => "i16",
+            ReprTy::U32 => "u32",
+            ReprTy::I32 => "i32",
+            ReprTy::U64 => "u64",
+            ReprTy::I64 => "i64",
+            ReprTy::USize => "usize",
+            ReprTy::ISize => "isize",
+            ReprTy::None => {
+                errs.push(Error::new(e.ident.span(),
+                                 "Missing repr type on `#[unsize]` item. The implicit `repr(Rust)` is unsupported."));
+                ""
+            }
+        },
+        Span::mixed_site(),
+    );
+
+    let name = &e.ident;
+    let vis = &e.vis;
+    let variants = &e.variants;
+
+    let meta_ty = make_meta_ty(e);
+    let phantom_ty = make_phantom_ty(e);
+    let field_ty = make_field_ty(e);
+    let (ref_ty, mut_ty) = make_ref_tys(e);
 
     let mut all_field_tys = Vec::new();
     let mut all_field_metas = Vec::new();
@@ -568,9 +621,9 @@ fn impls_enum(
     );
 
     errs.empty_or(())?;
-    let repr_ty = quote_spanned!(name.span() => isize);
 
     let meta_ty_name = &meta_ty.ident;
+    let phantom_ty_name = &phantom_ty.ident;
     let field_ty_name = &field_ty.ident;
     let ref_ty_name = &ref_ty.ident;
     let mut_ty_name = &mut_ty.ident;
@@ -584,7 +637,7 @@ fn impls_enum(
         impl #name {
             #vis fn as_ref<'a>(self: unsizing::Ref<'a, Self>) -> #ref_ty_name<'a> {
                 let layout = unsafe { <Self as unsizing::Pointee>::layout(unsizing::Ptr::from_ref(self)) };
-                #[allow(unused_unsafe)]
+                #[allow(unused_unsafe, clippy::init_numbered_fields)]
                 match layout.fields() {
                     #(
                     #field_ty_name::#variant_names( #var_match_fields ) => unsafe { #ref_ty_name::#variant_names { #var_as_ref } },
@@ -594,7 +647,7 @@ fn impls_enum(
 
             #vis fn as_mut<'a>(self: unsizing::RefMut<'a, Self>) -> #mut_ty_name<'a> {
                 let layout = unsafe { <Self as unsizing::Pointee>::layout(unsizing::PtrMut::from_mut(self).cast_const()) };
-                #[allow(unused_unsafe)]
+                #[allow(unused_unsafe, clippy::init_numbered_fields)]
                 match layout.fields() {
                     #(
                     #field_ty_name::#variant_names( #var_match_fields ) => unsafe { #mut_ty_name::#variant_names { #var_as_mut } },
@@ -603,7 +656,7 @@ fn impls_enum(
             }
         }
 
-        impl unsizing::Pointee for SliceOption {
+        impl unsizing::Pointee for #name {
             const IS_STD_UNSIZED: bool = false;
             // We need to track the size/align of the original enum location - since it may be greater than
             // what we see just from our current state. (EG SliceOptionSized::<[u32; 4]::None - our unsized
@@ -650,61 +703,79 @@ fn impls_enum(
                 unsizing::Layout::new(fields, repr_size + var_size, align)
             }
         }
+
+        #phantom_ty
+
+        impl unsizing::__impl::EnumHelper for #name {
+            type Phantom = #phantom_ty_name;
+        }
     ))
 }
 
-fn process_enum(e: ItemEnum) -> Result<TokenStream, MultiError> {
-    let val_span = e.span();
-    let mut errs = MultiError::empty();
-    let ItemEnum {
-        vis,
-        ident: name,
-        variants,
-        generics,
-        attrs,
-        ..
-    } = e;
-
-    if !attrs.is_empty() {
-        errs.push(Error::new(
-            attrs.first().unwrap().span(),
-            "`#[unsize]` currently doesn't support other item-level attributes",
-        ));
-    }
-    if !generics.to_token_stream().is_empty() {
-        errs.push(Error::new(
-            generics.span(),
-            "`#[unsize]` currently doesn't support generics",
-        ));
-    }
-
-    // If we have errors before here, emit now - struct-level errors mean field errors are likely
-    // redundant.
-    errs.empty_or(())?;
-
-    let pointee_impl = impls_enum(&name, &vis, &variants)?;
-    println!("Enum Impls: {}", pointee_impl.to_string());
-    // size_of_val on this is correct, but align_of_val is a lie - we just use a high enough alignment
-    // that it shouldn't cause issues.
-    // TODO: Provide a way to manually increase this alignment.
-    Ok(quote_spanned!(
-        val_span.span() =>
-        #[repr(C, align(16))]
-        #vis struct #name([std::mem::MaybeUninit<u8>]);
-
-        #pointee_impl
-    ))
+#[derive(Default)]
+struct Attrs<'a> {
+    docs: Vec<&'a Attribute>,
+    repr: ReprTy,
 }
 
 pub fn _impl(ts: TokenStream) -> Result<TokenStream, MultiError> {
-    let val = syn::parse2::<Item>(ts)?;
-    match val {
-        Item::Struct(s) => process_struct(s),
-        Item::Enum(e) => process_enum(e),
+    let item = syn::parse2::<Item>(ts)?;
+    let mut errs = MultiError::empty();
+
+    let mut attrs = Attrs::default();
+    for attr in item.attrs() {
+        if attr.path().is_ident("repr") {
+            if let Some(repr) = errs.and(ReprTy::parse_attr(attr, "unsize")) {
+                attrs.repr = repr;
+            }
+        } else if attr.path().is_ident("doc") {
+            attrs.docs.push(attr);
+        } else {
+            errs.push(Error::new(
+                attr.span(),
+                format!(
+                    "`#[unsize]` currently doesn't support attribute {}",
+                    attr.path().to_token_stream()
+                ),
+            ));
+        }
+    }
+
+    if let Some(generics) = item.generics() {
+        if !generics.to_token_stream().is_empty() {
+            errs.push(Error::new(
+                generics.span(),
+                "`#[unsize]` currently doesn't support generics",
+            ));
+        }
+    }
+
+    // If we have errors before here, emit now - item-level errors mean field errors are likely
+    // redundant.
+    errs.empty_or(())?;
+
+    let impls = match &item {
+        Item::Struct(s) => impls_struct(s, &attrs),
+        Item::Enum(e) => impls_enum(e, &attrs),
         _ => Err(Error::new(
-            val.span(),
-            format!("unsupported item type for `#[unsize]`, expected struct or enum"),
+            item.span(),
+            "unsupported item type for `#[unsize]`, expected struct or enum",
         )
         .into()),
-    }
+    }?;
+
+    let name = item.ident();
+    let vis = item.vis().unwrap();
+    let docs = &attrs.docs;
+
+    Ok(quote_spanned!(
+        item.span() =>
+        // size_of_val on this is correct, but align_of_val is a lie - we just use a high enough alignment
+        // that it shouldn't cause issues.
+        #( #docs )*
+        #[repr(C, align(16))]
+        #vis struct #name([std::mem::MaybeUninit<u8>]);
+
+        #impls
+    ))
 }
